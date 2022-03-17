@@ -1,0 +1,54 @@
+FROM ubuntu:latest
+
+env NDK_CCACHE=/app/ccache
+env CCACHE_DIR=/app.ccache
+
+RUN DEBIAN_FRONTEND="noninteractive" apt-get update -y && \
+    DEBIAN_FRONTEND="noninteractive" apt-get install -y openjdk-11-jdk python3 python3-distutils python3-apt g++ gcc \
+            acl \
+            aria2 \
+            binutils \
+            bison \
+            brotli \
+            bzip2 \
+            coreutils \
+            curl \
+            file \
+            flex \
+            ftp \
+            haveged \
+            jq \
+            m4 \
+            mediainfo \
+            netcat \
+            net-tools \
+            p7zip-full \
+            parallel \
+            pass \
+            patchelf \
+            pollinate \
+            rsync \
+            shellcheck \
+            sphinxsearch \
+            sqlite3 \
+            ssh \
+            sshpass \
+            subversion \
+            sudo \
+            swig \
+            telnet \
+            time \
+            unzip \
+            wget \
+            zip
+
+
+RUN DEBIAN_FRONTEND="noninteractive" apt-get install -y ccache
+
+COPY docker-scripts /docker-build/scripts
+RUN cd /docker-build/scripts && bash setup-android.sh && rm -rf /docker-build
+
+WORKDIR /app
+COPY . /app
+
+ENTRYPOINT ["tail", "-f", "/dev/null"]
