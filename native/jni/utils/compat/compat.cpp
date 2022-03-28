@@ -6,9 +6,7 @@
 #include <cerrno>
 #include <mntent.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/syscall.h>
-#include <sys/stat.h>
 
 extern "C" {
 
@@ -103,10 +101,6 @@ int inotify_init1(int flags) {
 
 int faccessat(int dirfd, const char *pathname, int mode, int flags) {
     return syscall(__NR_faccessat, dirfd, pathname, mode, flags);
-}
-
-int mkfifo(const char *path, mode_t mode) {
-    return mknod(path, (mode & ~S_IFMT) | S_IFIFO, 0);
 }
 
 #define SPLIT_64(v) (unsigned)((v) & 0xFFFFFFFF), (unsigned)((v) >> 32)

@@ -112,19 +112,14 @@ static void zygiskd(int socket) {
     vector<comp_entry> modules;
     {
         vector<int> module_fds = recv_fds(socket);
+        char buf[256];
         for (int fd : module_fds) {
+            snprintf(buf, sizeof(buf), "/proc/self/fd/%d", fd);
             comp_entry entry = nullptr;
-            android_dlextinfo info {
-                    .flags = ANDROID_DLEXT_USE_LIBRARY_FD,
-                    .library_fd = fd,
-            };
-            if (void *h = android_dlopen_ext("/jit-cache", RTLD_LAZY, &info)) {
+            if (void *h = dlopen(buf, RTLD_LAZY)) {
                 *(void **) &entry = dlsym(h, "zygisk_companion_entry");
-            } else {
-                LOGW("Failed to dlopen zygisk module: %s\n", dlerror());
             }
             modules.push_back(entry);
-            close(fd);
         }
     }
 

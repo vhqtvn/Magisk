@@ -22,13 +22,29 @@ struct BootConfig {
     void print();
 };
 
+struct fstab_entry {
+    std::string dev;
+    std::string mnt_point;
+    std::string type;
+    std::string mnt_flags;
+    std::string fsmgr_flags;
+
+    fstab_entry() = default;
+    fstab_entry(const fstab_entry &) = delete;
+    fstab_entry(fstab_entry &&) = default;
+    fstab_entry &operator=(const fstab_entry&) = delete;
+    fstab_entry &operator=(fstab_entry&&) = default;
+    void to_file(FILE *fp);
+};
+
+#define INIT_SOCKET "MAGISKINIT"
 #define DEFAULT_DT_DIR "/proc/device-tree/firmware/android"
 
 extern std::vector<std::string> mount_list;
 
-int magisk_proxy_main(int argc, char *argv[]);
 bool unxz(int fd, const uint8_t *buf, size_t size);
 void load_kernel_info(BootConfig *config);
+bool is_dsu();
 bool check_two_stage();
 void setup_klog();
 const char *backup_init();
@@ -43,18 +59,17 @@ protected:
     char **argv = nullptr;
 
     [[noreturn]] void exec_init();
+    void read_dt_fstab(std::vector<fstab_entry> &fstab);
 public:
-    BaseInit(char *argv[], BootConfig *config = nullptr) : config(config), argv(argv) {}
+    BaseInit(char *argv[], BootConfig *config) : config(config), argv(argv) {}
     virtual ~BaseInit() = default;
     virtual void start() = 0;
 };
 
 class MagiskInit : public BaseInit {
-private:
-    void mount_rules_dir();
 protected:
     mmap_data self;
-    mmap_data magisk_cfg;
+    mmap_data magisk_config;
     std::string custom_rules_dir;
 
 #if ENABLE_AVD_HACK
@@ -62,26 +77,27 @@ protected:
     // running magiskinit on legacy SAR AVD emulator
     bool avd_hack = false;
 #else
-    // Make it constexpr so compiler can optimize hacks out of the code
-    static constexpr bool avd_hack = false;
+    // Make it const so compiler can optimize hacks out of the code
+    static const bool avd_hack = false;
 #endif
 
-    void patch_sepolicy(const char *file);
-    void hijack_sepolicy();
+    void mount_with_dt();
+    bool patch_sepolicy(const char *file);
     void setup_tmp(const char *path);
-    void patch_rw_root();
+    void mount_rules_dir(const char *dev_base, const char *mnt_base);
 public:
-    using BaseInit::BaseInit;
+    MagiskInit(char *argv[], BootConfig *cmd) : BaseInit(argv, cmd) {}
 };
 
-class SARBase : public MagiskInit {
+class SARBase : virtual public MagiskInit {
 protected:
     std::vector<raw_file> overlays;
 
     void backup_files();
-    void patch_ro_root();
+    void patch_rootdir();
+    void mount_system_root();
 public:
-    using MagiskInit::MagiskInit;
+    SARBase() = default;
 };
 
 /***************
@@ -91,30 +107,13 @@ public:
 class FirstStageInit : public BaseInit {
 private:
     void prepare();
+    void get_default_fstab(char *buf, size_t len);
 public:
-    FirstStageInit(char *argv[], BootConfig *config) : BaseInit(argv, config) {
+    FirstStageInit(char *argv[], BootConfig *cmd) : BaseInit(argv, cmd) {
         LOGD("%s\n", __FUNCTION__);
     };
     void start() override {
         prepare();
-        exec_init();
-    }
-};
-
-class SecondStageInit : public SARBase {
-private:
-    bool prepare();
-public:
-    SecondStageInit(char *argv[]) : SARBase(argv) {
-        setup_klog();
-        LOGD("%s\n", __FUNCTION__);
-    };
-
-    void start() override {
-        if (prepare())
-            patch_rw_root();
-        else
-            patch_ro_root();
         exec_init();
     }
 };
@@ -123,19 +122,22 @@ public:
  * Legacy SAR
  *************/
 
-class LegacySARInit : public SARBase {
+class SARInit : public SARBase {
 private:
-    bool mount_system_root();
+    bool is_two_stage;
+
+    void early_mount();
     void first_stage_prep();
 public:
-    LegacySARInit(char *argv[], BootConfig *config) : SARBase(argv, config) {
+    SARInit(char *argv[], BootConfig *cmd) : MagiskInit(argv, cmd), is_two_stage(false) {
         LOGD("%s\n", __FUNCTION__);
     };
     void start() override {
-        if (mount_system_root())
+        early_mount();
+        if (is_two_stage)
             first_stage_prep();
         else
-            patch_ro_root();
+            patch_rootdir();
         exec_init();
     }
 };
@@ -144,16 +146,49 @@ public:
  * Initramfs
  ************/
 
-class RootFSInit : public MagiskInit {
-private:
-    void prepare();
+class RootFSBase : virtual public MagiskInit {
+protected:
+    void patch_rootfs();
 public:
-    RootFSInit(char *argv[], BootConfig *config) : MagiskInit(argv, config) {
+    RootFSBase() = default;
+    void start() = 0;
+};
+
+class RootFSInit : public RootFSBase {
+private:
+    void early_mount();
+
+public:
+    RootFSInit(char *argv[], BootConfig *cmd) : MagiskInit(argv, cmd) {
         LOGD("%s\n", __FUNCTION__);
     }
     void start() override {
-        prepare();
-        patch_rw_root();
+        early_mount();
+        patch_rootfs();
         exec_init();
     }
+};
+
+class SecondStageInit : public RootFSBase, public SARBase {
+private:
+    bool prepare();
+public:
+    SecondStageInit(char *argv[]) : MagiskInit(argv, nullptr) {
+        LOGD("%s\n", __FUNCTION__);
+    };
+
+    void start() override {
+        if (prepare()) patch_rootfs();
+        else patch_rootdir();
+        exec_init();
+    }
+};
+
+
+class MagiskProxy : public MagiskInit {
+public:
+    explicit MagiskProxy(char *argv[]) : MagiskInit(argv, nullptr) {
+        LOGD("%s\n", __FUNCTION__);
+    }
+    void start() override;
 };

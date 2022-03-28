@@ -63,11 +63,13 @@ LOCAL_SRC_FILES := \
     init/rootdir.cpp \
     init/getinfo.cpp \
     init/twostage.cpp \
-    init/selinux.cpp \
+    core/socket.cpp \
     magiskpolicy/sepolicy.cpp \
+    magiskpolicy/magiskpolicy.cpp \
     magiskpolicy/rules.cpp \
     magiskpolicy/policydb.cpp \
-    magiskpolicy/statement.cpp
+    magiskpolicy/statement.cpp \
+    magiskboot/pattern.cpp
 
 LOCAL_LDFLAGS := -static
 include $(BUILD_EXECUTABLE)
@@ -109,16 +111,19 @@ ifdef B_POLICY
 include $(CLEAR_VARS)
 LOCAL_MODULE := magiskpolicy
 LOCAL_STATIC_LIBRARIES := \
-    libutils \
+    libutilx \
     libsepol
 
 LOCAL_SRC_FILES := \
-    magiskpolicy/main.cpp \
+    core/applet_stub.cpp \
     magiskpolicy/sepolicy.cpp \
+    magiskpolicy/magiskpolicy.cpp \
     magiskpolicy/rules.cpp \
     magiskpolicy/policydb.cpp \
     magiskpolicy/statement.cpp
 
+LOCAL_CFLAGS := -DAPPLET_STUB_MAIN=magiskpolicy_main
+LOCAL_LDFLAGS := -static
 include $(BUILD_EXECUTABLE)
 
 endif

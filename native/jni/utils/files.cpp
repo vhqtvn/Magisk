@@ -291,29 +291,18 @@ void full_read(const char *filename, void **buf, size_t *size) {
     close(fd);
 }
 
-void fd_full_read(int fd, string &str) {
+string fd_full_read(int fd) {
     char buf[4096];
+    string str;
     for (ssize_t len; (len = xread(fd, buf, sizeof(buf))) > 0;)
         str.insert(str.end(), buf, buf + len);
-}
-
-void full_read(const char *filename, string &str) {
-    if (int fd = xopen(filename, O_RDONLY | O_CLOEXEC); fd >= 0) {
-        fd_full_read(fd, str);
-        close(fd);
-    }
-}
-
-string fd_full_read(int fd) {
-    string str;
-    fd_full_read(fd, str);
     return str;
 }
 
 string full_read(const char *filename) {
-    string str;
-    full_read(filename, str);
-    return str;
+    int fd = xopen(filename, O_RDONLY | O_CLOEXEC);
+    run_finally f([=]{ close(fd); });
+    return fd < 0 ? "" : fd_full_read(fd);
 }
 
 void write_zero(int fd, size_t size) {
@@ -326,7 +315,10 @@ void write_zero(int fd, size_t size) {
     }
 }
 
-void file_readline(bool trim, FILE *fp, const function<bool(string_view)> &fn) {
+void file_readline(bool trim, const char *file, const function<bool(string_view)> &fn) {
+    FILE *fp = xfopen(file, "re");
+    if (fp == nullptr)
+        return;
     size_t len = 1024;
     char *buf = (char *) malloc(len);
     char *start;

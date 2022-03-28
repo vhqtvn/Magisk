@@ -1,5 +1,13 @@
+#include <string_view>
 #include <mincrypt/sha.h>
 #include <utils.hpp>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <errno.h>
 
 #include "magiskboot.hpp"
 #include "compress.hpp"
@@ -19,6 +27,7 @@ R"EOF(MagiskBoot - Boot Image Modification Tool
 Usage: %s <action> [args...]
 
 Supported actions:
+  remount
   unpack [-n] [-h] <bootimg>
     Unpack <bootimg> to, if available, kernel, kernel_dtb, ramdisk.cpio,
     second, dtb, extra, and recovery_dtbo into current directory.
@@ -113,6 +122,56 @@ Supported actions:
     exit(1);
 }
 
+static __inline__ int  unix_open(const char*  path, int options,...)
+{
+    if ((options & O_CREAT) == 0)
+    {
+        return  TEMP_FAILURE_RETRY( open(path, options) );
+    }
+    else
+    {
+        int      mode;
+        va_list  args;
+        va_start( args, options );
+        mode = va_arg( args, int );
+        va_end( args );
+        return TEMP_FAILURE_RETRY( open( path, options, mode ) );
+    }
+}
+
+
+/* Returns the device used to mount a directory in /proc/mounts */
+static char *find_mount(const char *dir)
+{
+    int fd;
+    int res;
+    int size;
+    char *token = NULL;
+    const char delims[] = "\n";
+    char buf[4096];
+    fd = unix_open("/proc/mounts", O_RDONLY);
+    if (fd < 0)
+        return NULL;
+    buf[sizeof(buf) - 1] = '\0';
+    size = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    token = strtok(buf, delims);
+    while (token) {
+        char mount_dev[256];
+        char mount_dir[256];
+        int mount_freq;
+        int mount_passno;
+        res = sscanf(token, "%255s %255s %*s %*s %d %d\n",
+                     mount_dev, mount_dir, &mount_freq, &mount_passno);
+        mount_dev[255] = 0;
+        mount_dir[255] = 0;
+        if (res == 4 && (strcmp(dir, mount_dir) == 0))
+            return strdup(mount_dev);
+        token = strtok(NULL, delims);
+    }
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     cmdline_logging();
     umask(0);
@@ -135,6 +194,21 @@ int main(int argc, char *argv[]) {
         unlink(EXTRA_FILE);
         unlink(RECV_DTBO_FILE);
         unlink(DTB_FILE);
+    } else if (argc >= 2 && action == "remount") {
+        char *dev;
+        int fd;
+        int OFF = 0;
+        dev = find_mount("/system");
+        if (!dev)
+            return -1;
+        fd = unix_open(dev, O_RDONLY);
+        if (fd < 0)
+            return -1;
+        ioctl(fd, BLKROSET, &OFF);
+        close(fd);
+        int system_ro = mount(dev, "/system", "none", MS_REMOUNT, NULL);
+        free(dev);
+        printf("%d\n",system_ro);
     } else if (argc > 2 && action == "sha1") {
         uint8_t sha1[SHA_DIGEST_SIZE];
         auto m = mmap_data(argv[2]);
