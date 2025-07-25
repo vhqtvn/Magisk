@@ -1,568 +1,880 @@
 #!/usr/bin/env python3
 import argparse
-import errno
-import lzma
+import copy
+import glob
 import multiprocessing
 import os
-import os.path as op
 import platform
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import textwrap
 import urllib.request
-import zipfile
-from distutils.dir_util import copy_tree
+from pathlib import Path
+from zipfile import ZipFile
+
+
+def color_print(code, str):
+    if no_color:
+        print(str)
+    else:
+        str = str.replace("\n", f"\033[0m\n{code}")
+        print(f"{code}{str}\033[0m")
 
 
 def error(str):
-    if is_ci:
-        print(f'\n ! {str}\n')
-    else:
-        print(f'\n\033[41m{str}\033[0m\n')
+    color_print("\033[41;39m", f"\n! {str}\n")
     sys.exit(1)
 
 
 def header(str):
-    if is_ci:
-        print(f'\n{str}\n')
-    else:
-        print(f'\n\033[44m{str}\033[0m\n')
+    color_print("\033[44;39m", f"\n{str}\n")
 
 
 def vprint(str):
-    if args.verbose:
+    if args.verbose > 0:
         print(str)
 
 
-is_windows = os.name == 'nt'
-is_ci = 'CI' in os.environ and os.environ['CI'] == 'true'
+# Environment checks and detection
+is_windows = os.name == "nt"
+EXE_EXT = ".exe" if is_windows else ""
 
-if not is_ci and is_windows:
-    import colorama
+no_color = False
+if is_windows:
+    try:
+        import colorama
 
-    colorama.init()
+        colorama.init()
+    except ImportError:
+        # We can't do ANSI color codes in terminal on Windows without colorama
+        no_color = True
 
-# Environment checks
-if not sys.version_info >= (3, 6):
-    error('Requires Python 3.6+')
-
-if 'ANDROID_SDK_ROOT' not in os.environ:
-    error('Please add Android SDK path to ANDROID_SDK_ROOT environment variable!')
-
-try:
-    subprocess.run(['javac', '-version'],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-except FileNotFoundError:
-    error('Please install JDK and make sure \'javac\' is available in PATH')
+if not sys.version_info >= (3, 8):
+    error("Requires Python 3.8+")
 
 cpu_count = multiprocessing.cpu_count()
-archs = ['armeabi-v7a', 'x86', 'arm64-v8a', 'x86_64']
-default_targets = ['magisk', 'magiskinit', 'magiskboot', 'magiskpolicy', 'busybox']
-support_targets = default_targets + ['resetprop', 'test']
+os_name = platform.system().lower()
 
-sdk_path = os.environ['ANDROID_SDK_ROOT']
-ndk_root = op.join(sdk_path, 'ndk')
-ndk_path = op.join(ndk_root, 'magisk')
-ndk_build = op.join(ndk_path, 'ndk-build')
-gradlew = op.join('.', 'gradlew' + ('.bat' if is_windows else ''))
-adb_path = op.join(sdk_path, 'platform-tools', 'adb' + ('.exe' if is_windows else ''))
-native_gen_path = op.join('native', 'out', 'generated')
+# Common constants
+support_abis = {
+    "armeabi-v7a": "thumbv7neon-linux-androideabi",
+    "x86": "i686-linux-android",
+    "arm64-v8a": "aarch64-linux-android",
+    "x86_64": "x86_64-linux-android",
+    "riscv64": "riscv64-linux-android",
+}
+default_archs = {"armeabi-v7a", "x86", "arm64-v8a", "x86_64"}
+default_targets = {"magisk", "magiskinit", "magiskboot", "magiskpolicy"}
+support_targets = default_targets | {"resetprop"}
+rust_targets = {"magisk", "magiskinit", "magiskboot", "magiskpolicy"}
+ondk_version = "r28.5"
 
 # Global vars
 config = {}
-STDOUT = None
-build_tools = None
+args = {}
+build_abis = {}
+
+###################
+# Helper functions
+###################
 
 
-def mv(source, target):
+def mv(source: Path, target: Path):
     try:
         shutil.move(source, target)
-        vprint(f'mv {source} -> {target}')
+        vprint(f"mv {source} -> {target}")
     except:
         pass
 
 
-def cp(source, target):
+def cp(source: Path, target: Path):
     try:
         shutil.copyfile(source, target)
-        vprint(f'cp {source} -> {target}')
+        vprint(f"cp {source} -> {target}")
     except:
         pass
 
 
-def rm(file):
+def rm(file: Path):
     try:
         os.remove(file)
-        vprint(f'rm {file}')
-    except OSError as e:
-        if e.errno != errno.ENOENT:
-            raise
+        vprint(f"rm {file}")
+    except FileNotFoundError as e:
+        pass
 
 
 def rm_on_error(func, path, _):
-    # Remove a read-only file on Windows will get "WindowsError: [Error 5] Access is denied"
-    # Clear the "read-only" and retry
-    os.chmod(path, stat.S_IWRITE)
-    os.unlink(path)
-
-
-def rm_rf(path):
-    vprint(f'rm -rf {path}')
-    shutil.rmtree(path, ignore_errors=True, onerror=rm_on_error)
-
-
-def mkdir(path, mode=0o755):
+    # Removing a read-only file on Windows will get "WindowsError: [Error 5] Access is denied"
+    # Clear the "read-only" bit and retry
     try:
-        os.mkdir(path, mode)
-    except:
+        os.chmod(path, stat.S_IWRITE)
+        os.unlink(path)
+    except FileNotFoundError as e:
         pass
 
 
-def mkdir_p(path, mode=0o755):
-    os.makedirs(path, mode, exist_ok=True)
+def rm_rf(path: Path):
+    vprint(f"rm -rf {path}")
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, ignore_errors=False, onexc=rm_on_error)
+    else:
+        shutil.rmtree(path, ignore_errors=False, onerror=rm_on_error)
 
 
-def execv(cmd):
-    return subprocess.run(cmd, stdout=STDOUT)
+def execv(cmds: list, env=None):
+    out = None if args.force_out or args.verbose > 0 else subprocess.DEVNULL
+    # Use shell on Windows to support PATHEXT
+    return subprocess.run(cmds, stdout=out, env=env, shell=is_windows)
 
 
-def system(cmd):
-    return subprocess.run(cmd, shell=True, stdout=STDOUT)
+def cmd_out(cmds: list):
+    return (
+        subprocess.run(
+            cmds,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=is_windows,
+        )
+        .stdout.strip()
+        .decode("utf-8")
+    )
 
 
-def cmd_out(cmd):
-    return subprocess.check_output(cmd).strip().decode('utf-8')
+###############
+# Build Native
+###############
 
 
-def xz(data):
-    return lzma.compress(data, preset=9, check=lzma.CHECK_NONE)
+def clean_elf():
+    cargo_toml = Path("tools", "elf-cleaner", "Cargo.toml")
+    cmds = ["run", "--release", "--manifest-path", cargo_toml]
+    if args.verbose == 0:
+        cmds.append("-q")
+    elif args.verbose > 1:
+        cmds.append("--verbose")
+    cmds.append("--")
+    cmds.extend(glob.glob("native/out/*/magisk"))
+    cmds.extend(glob.glob("native/out/*/magiskpolicy"))
+    run_cargo(cmds)
+
+
+def collect_ndk_build():
+    for arch in build_abis.keys():
+        arch_dir = Path("native", "libs", arch)
+        out_dir = Path("native", "out", arch)
+        for source in arch_dir.iterdir():
+            target = out_dir / source.name
+            mv(source, target)
+
+
+def run_ndk_build(cmds: list):
+    os.chdir("native")
+    cmds.append("NDK_PROJECT_PATH=.")
+    cmds.append("NDK_APPLICATION_MK=src/Application.mk")
+    cmds.append(f"APP_ABI={' '.join(build_abis.keys())}")
+    cmds.append(f"-j{cpu_count}")
+    if args.verbose > 1:
+        cmds.append("V=1")
+    if not args.release:
+        cmds.append("MAGISK_DEBUG=1")
+    proc = execv([ndk_build, *cmds])
+    if proc.returncode != 0:
+        error("Build binary failed!")
+    os.chdir("..")
+
+
+def build_cpp_src(targets: set):
+    cmds = []
+    clean = False
+
+    if "magisk" in targets:
+        cmds.append("B_MAGISK=1")
+        clean = True
+
+    if "magiskpolicy" in targets:
+        cmds.append("B_POLICY=1")
+        clean = True
+
+    if "magiskinit" in targets:
+        cmds.append("B_PRELOAD=1")
+
+    if "resetprop" in targets:
+        cmds.append("B_PROP=1")
+
+    if cmds:
+        run_ndk_build(cmds)
+        collect_ndk_build()
+
+    cmds.clear()
+
+    if "magiskinit" in targets:
+        cmds.append("B_INIT=1")
+
+    if "magiskboot" in targets:
+        cmds.append("B_BOOT=1")
+
+    if cmds:
+        cmds.append("B_CRT0=1")
+        run_ndk_build(cmds)
+        collect_ndk_build()
+
+    if clean:
+        clean_elf()
+
+
+def run_cargo(cmds):
+    ensure_paths()
+    env = os.environ.copy()
+    env["RUSTUP_TOOLCHAIN"] = str(rust_sysroot)
+    env["CARGO_BUILD_RUSTFLAGS"] = f"-Z threads={min(8, cpu_count)}"
+    return execv(["cargo", *cmds], env)
+
+
+def build_rust_src(targets: set):
+    targets = targets.copy()
+    if "resetprop" in targets:
+        targets.add("magisk")
+    targets = targets & rust_targets
+    if not targets:
+        return
+
+    os.chdir(Path("native", "src"))
+
+    # Start building the build commands
+    cmds = ["build", "-p", ""]
+    if args.release:
+        cmds.append("-r")
+        profile = "release"
+    else:
+        profile = "debug"
+    if args.verbose == 0:
+        cmds.append("-q")
+    elif args.verbose > 1:
+        cmds.append("--verbose")
+
+    for triple in build_abis.values():
+        cmds.append("--target")
+        cmds.append(triple)
+
+    for tgt in targets:
+        cmds[2] = tgt
+        proc = run_cargo(cmds)
+        if proc.returncode != 0:
+            error("Build binary failed!")
+
+    os.chdir(Path("..", ".."))
+
+    native_out = Path("native", "out")
+    rust_out = native_out / "rust"
+    for arch, triple in build_abis.items():
+        arch_out = native_out / arch
+        arch_out.mkdir(mode=0o755, exist_ok=True)
+        for tgt in targets:
+            source = rust_out / triple / profile / f"lib{tgt}.a"
+            target = arch_out / f"lib{tgt}-rs.a"
+            mv(source, target)
+
+
+def write_if_diff(file_name: Path, text: str):
+    do_write = True
+    if file_name.exists():
+        with open(file_name, "r") as f:
+            orig = f.read()
+        do_write = orig != text
+    if do_write:
+        with open(file_name, "w") as f:
+            f.write(text)
+
+
+def dump_flag_header():
+    flag_txt = "#pragma once\n"
+    flag_txt += f'#define MAGISK_VERSION      "{config["version"]}"\n'
+    flag_txt += f'#define MAGISK_VER_CODE     {config["versionCode"]}\n'
+    flag_txt += f"#define MAGISK_DEBUG        {0 if args.release else 1}\n"
+
+    native_gen_path = Path("native", "out", "generated")
+    native_gen_path.mkdir(mode=0o755, parents=True, exist_ok=True)
+    write_if_diff(native_gen_path / "flags.h", flag_txt)
+
+    rust_flag_txt = f'pub const MAGISK_VERSION: &str = "{config["version"]}";\n'
+    rust_flag_txt += f'pub const MAGISK_VER_CODE: i32 = {config["versionCode"]};\n'
+    write_if_diff(native_gen_path / "flags.rs", rust_flag_txt)
+
+
+def ensure_toolchain():
+    ensure_paths()
+
+    # Verify NDK install
+    try:
+        with open(Path(ndk_path, "ONDK_VERSION"), "r") as ondk_ver:
+            assert ondk_ver.read().strip(" \t\r\n") == ondk_version
+    except:
+        error('Unmatched NDK. Please install/upgrade NDK with "build.py ndk"')
+
+    if sccache := shutil.which("sccache"):
+        os.environ["RUSTC_WRAPPER"] = sccache
+        os.environ["NDK_CCACHE"] = sccache
+        os.environ["CARGO_INCREMENTAL"] = "0"
+    if ccache := shutil.which("ccache"):
+        os.environ["NDK_CCACHE"] = ccache
+
+
+def build_native():
+    ensure_toolchain()
+
+    if "targets" not in vars(args) or not args.targets:
+        targets = default_targets
+    else:
+        targets = set(args.targets) & support_targets
+        if not targets:
+            return
+
+    header("* Building: " + " ".join(targets))
+
+    dump_flag_header()
+    build_rust_src(targets)
+    build_cpp_src(targets)
+
+
+############
+# Build App
+############
+
+
+def find_jdk():
+    env = os.environ.copy()
+    if "ANDROID_STUDIO" in env:
+        studio = env["ANDROID_STUDIO"]
+        jbr = Path(studio, "jbr", "bin")
+        if not jbr.exists():
+            jbr = Path(studio, "Contents", "jbr", "Contents", "Home", "bin")
+        if jbr.exists():
+            env["PATH"] = f'{jbr}{os.pathsep}{env["PATH"]}'
+
+    no_jdk = False
+    try:
+        proc = subprocess.run(
+            "javac -version",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            shell=True,
+        )
+        no_jdk = proc.returncode != 0
+    except FileNotFoundError:
+        no_jdk = True
+
+    if no_jdk:
+        error(
+            "Please set Android Studio's path to environment variable ANDROID_STUDIO,\n"
+            + "or install JDK 21 and make sure 'javac' is available in PATH"
+        )
+
+    return env
+
+
+def build_apk(module: str):
+    ensure_paths()
+    env = find_jdk()
+    props = args.config.resolve()
+
+    os.chdir("app")
+    build_type = "Release" if args.release else "Debug"
+    proc = execv(
+        [
+            gradlew,
+            f"{module}:assemble{build_type}",
+            f"-PconfigPath={props}",
+        ],
+        env=env,
+    )
+    os.chdir("..")
+    if proc.returncode != 0:
+        error(f"Build {module} failed!")
+
+    build_type = build_type.lower()
+
+    paths = module.split(":")
+
+    apk = f"{paths[-1]}-{build_type}.apk"
+    source = Path("app", *paths, "build", "outputs", "apk", build_type, apk)
+    target = config["outdir"] / apk
+    mv(source, target)
+    return target
+
+
+def build_app():
+    header("* Building the Magisk app")
+    apk = build_apk(":apk")
+
+    build_type = "release" if args.release else "debug"
+
+    # Rename apk-variant.apk to app-variant.apk
+    source = apk
+    target = apk.parent / apk.name.replace("apk-", "app-")
+    mv(source, target)
+    header(f"Output: {target}")
+
+    # Stub building is directly integrated into the main app
+    # build process. Copy the stub APK into output directory.
+    source = Path("app", "core", "src", build_type, "assets", "stub.apk")
+    target = config["outdir"] / f"stub-{build_type}.apk"
+    cp(source, target)
+
+
+def build_stub():
+    header("* Building the stub app")
+    apk = build_apk(":stub")
+    header(f"Output: {apk}")
+
+
+def build_test():
+    global args
+    args_bak = copy.copy(args)
+    # Test APK has to be built as release to prevent classname clash
+    args.release = True
+    try:
+        header("* Building the test app")
+        source = build_apk(":test")
+        target = source.parent / "test.apk"
+        mv(source, target)
+        header(f"Output: {target}")
+    finally:
+        args = args_bak
+
+
+################
+# Build General
+################
+
+
+def cleanup():
+    ensure_paths()
+    support_targets = {"native", "cpp", "rust", "app"}
+    if args.targets:
+        targets = set(args.targets) & support_targets
+        if "native" in targets:
+            targets.add("cpp")
+            targets.add("rust")
+    else:
+        targets = support_targets
+
+    if "cpp" in targets:
+        header("* Cleaning C++")
+        rm_rf(Path("native", "libs"))
+        rm_rf(Path("native", "obj"))
+
+    if "rust" in targets:
+        header("* Cleaning Rust")
+        rm_rf(Path("native", "src", "target"))
+        rm(Path("native", "src", "boot", "proto", "mod.rs"))
+        rm(Path("native", "src", "boot", "proto", "update_metadata.rs"))
+        for rs_gen in glob.glob("native/**/*-rs.*pp", recursive=True):
+            rm(rs_gen)
+
+    if "native" in targets:
+        header("* Cleaning native")
+        rm_rf(Path("native", "out"))
+        rm_rf(Path("tools", "elf-cleaner", "target"))
+
+    if "app" in targets:
+        header("* Cleaning app")
+        os.chdir("app")
+        execv([gradlew, ":clean"], env=find_jdk())
+        os.chdir("..")
+
+
+def build_all():
+    build_native()
+    build_app()
+    build_test()
+
+
+############
+# Utilities
+############
+
+
+def gen_ide():
+    ensure_paths()
+    set_archs({args.abi})
+
+    # Dump flags for both C++ and Rust code
+    dump_flag_header()
+
+    # Run build.rs to generate Rust/C++ FFI bindings
+    os.chdir(Path("native", "src"))
+    run_cargo(["check"])
+    os.chdir(Path("..", ".."))
+
+    # Generate compilation database
+    rm_rf(Path("native", "compile_commands.json"))
+    run_ndk_build(
+        [
+            "B_MAGISK=1",
+            "B_INIT=1",
+            "B_BOOT=1",
+            "B_POLICY=1",
+            "B_PRELOAD=1",
+            "B_PROP=1",
+            "B_CRT0=1",
+            "compile_commands.json",
+        ]
+    )
+
+
+def clippy_cli():
+    ensure_toolchain()
+    args.force_out = True
+    set_archs(default_archs)
+
+    os.chdir(Path("native", "src"))
+    cmds = ["clippy", "--no-deps", "--target"]
+    for triple in build_abis.values():
+        run_cargo(cmds + [triple])
+        run_cargo(cmds + [triple, "--release"])
+    os.chdir(Path("..", ".."))
+
+
+def cargo_cli():
+    args.force_out = True
+    if len(args.commands) >= 1 and args.commands[0] == "--":
+        args.commands = args.commands[1:]
+    os.chdir(Path("native", "src"))
+    run_cargo(args.commands)
+    os.chdir(Path("..", ".."))
+
+
+def setup_ndk():
+    ensure_paths()
+    url = f"https://github.com/topjohnwu/ondk/releases/download/{ondk_version}/ondk-{ondk_version}-{os_name}.tar.xz"
+    ndk_archive = url.split("/")[-1]
+    ondk_path = Path(ndk_root, f"ondk-{ondk_version}")
+
+    header(f"* Downloading and extracting {ndk_archive}")
+    rm_rf(ondk_path)
+    with urllib.request.urlopen(url) as response:
+        with tarfile.open(mode="r|xz", fileobj=response) as tar:
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(ndk_root, filter="tar")
+            else:
+                tar.extractall(ndk_root)
+
+    rm_rf(ndk_path)
+    mv(ondk_path, ndk_path)
+
+
+def setup_rustup():
+    wrapper_dir = Path(args.wrapper_dir)
+    rm_rf(wrapper_dir)
+    wrapper_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if "CARGO_HOME" in os.environ:
+        cargo_home = Path(os.environ["CARGO_HOME"])
+    else:
+        cargo_home = Path.home() / ".cargo"
+    cargo_bin = cargo_home / "bin"
+    for src in cargo_bin.iterdir():
+        tgt = wrapper_dir / src.name
+        tgt.symlink_to(f"rustup{EXE_EXT}")
+
+    # Build rustup-wrapper
+    wrapper_src = Path("tools", "rustup-wrapper")
+    cargo_toml = wrapper_src / "Cargo.toml"
+    cmds = ["build", "--release", f"--manifest-path={cargo_toml}"]
+    if args.verbose > 1:
+        cmds.append("--verbose")
+    run_cargo(cmds)
+
+    # Replace rustup with wrapper
+    wrapper = wrapper_dir / (f"rustup{EXE_EXT}")
+    wrapper.unlink(missing_ok=True)
+    cp(wrapper_src / "target" / "release" / (f"rustup-wrapper{EXE_EXT}"), wrapper)
+    wrapper.chmod(0o755)
+
+
+##################
+# AVD and testing
+##################
+
+
+def push_files(script):
+    if args.build:
+        build_all()
+    ensure_adb()
+
+    abi = cmd_out([adb_path, "shell", "getprop", "ro.product.cpu.abi"])
+    if not abi:
+        error("Cannot detect emulator ABI")
+
+    if args.apk:
+        apk = Path(args.apk)
+    else:
+        apk = Path(
+            config["outdir"], ("app-release.apk" if args.release else "app-debug.apk")
+        )
+
+    # Extract busybox from APK
+    busybox = Path(config["outdir"], "busybox")
+    with ZipFile(apk) as zf:
+        with zf.open(f"lib/{abi}/libbusybox.so") as libbb:
+            with open(busybox, "wb") as bb:
+                bb.write(libbb.read())
+
+    try:
+        proc = execv([adb_path, "push", busybox, script, "/data/local/tmp"])
+        if proc.returncode != 0:
+            error("adb push failed!")
+    finally:
+        rm_rf(busybox)
+
+    proc = execv([adb_path, "push", apk, "/data/local/tmp/magisk.apk"])
+    if proc.returncode != 0:
+        error("adb push failed!")
+
+
+def setup_avd():
+    header("* Setting up emulator")
+
+    push_files(Path("scripts", "live_setup.sh"))
+
+    proc = execv([adb_path, "shell", "sh", "/data/local/tmp/live_setup.sh"])
+    if proc.returncode != 0:
+        error("live_setup.sh failed!")
+
+
+def patch_avd_file():
+    input = Path(args.image)
+    output = Path(args.output)
+
+    header(f"* Patching {input.name}")
+
+    push_files(Path("scripts", "host_patch.sh"))
+
+    proc = execv([adb_path, "push", input, "/data/local/tmp"])
+    if proc.returncode != 0:
+        error("adb push failed!")
+
+    src_file = f"/data/local/tmp/{input.name}"
+    out_file = f"{src_file}.magisk"
+
+    proc = execv([adb_path, "shell", "sh", "/data/local/tmp/host_patch.sh", src_file])
+    if proc.returncode != 0:
+        error("host_patch.sh failed!")
+
+    proc = execv([adb_path, "pull", out_file, output])
+    if proc.returncode != 0:
+        error("adb pull failed!")
+
+    header(f"Output: {output}")
+
+
+##########################
+# Config, paths, argparse
+##########################
+
+
+def ensure_paths():
+    global sdk_path, ndk_root, ndk_path, ndk_build, rust_sysroot
+    global llvm_bin, gradlew, adb_path, native_gen_path
+
+    # Skip if already initialized
+    if "sdk_path" in globals():
+        return
+
+    try:
+        sdk_path = Path(os.environ["ANDROID_HOME"])
+    except KeyError:
+        try:
+            sdk_path = Path(os.environ["ANDROID_SDK_ROOT"])
+        except KeyError:
+            error("Please set Android SDK path to environment variable ANDROID_HOME")
+
+    ndk_root = sdk_path / "ndk"
+    ndk_path = ndk_root / "magisk"
+    ndk_build = ndk_path / "ndk-build"
+    rust_sysroot = ndk_path / "toolchains" / "rust"
+    llvm_bin = (
+        ndk_path / "toolchains" / "llvm" / "prebuilt" / f"{os_name}-x86_64" / "bin"
+    )
+    adb_path = sdk_path / "platform-tools" / "adb"
+    gradlew = Path.cwd() / "app" / "gradlew"
+
+
+# We allow using several functionality with only ADB
+def ensure_adb():
+    global adb_path
+    if "adb_path" not in globals():
+        adb_path = shutil.which("adb")
+        if not adb_path:
+            error("Command 'adb' cannot be found in PATH")
+        else:
+            adb_path = Path(adb_path)
 
 
 def parse_props(file):
     props = {}
-    with open(file, 'r') as f:
-        for line in [l.strip(' \t\r\n') for l in f]:
-            if line.startswith('#') or len(line) == 0:
+    with open(file, "r") as f:
+        for line in [l.strip(" \t\r\n") for l in f]:
+            if line.startswith("#") or len(line) == 0:
                 continue
-            prop = line.split('=')
+            prop = line.split("=")
             if len(prop) != 2:
                 continue
-            value = prop[1].strip(' \t\r\n')
-            if len(value) == 0:
+            key = prop[0].strip(" \t\r\n")
+            value = prop[1].strip(" \t\r\n")
+            if not key or not value:
                 continue
-            props[prop[0].strip(' \t\r\n')] = value
+            props[key] = value
     return props
 
 
-def load_config(args):
-    commit_hash = cmd_out(['git', 'rev-parse', '--short=8', 'HEAD'])
+def set_archs(archs: set):
+    triples = map(support_abis.get, archs)
+    global build_abis
+    build_abis = dict(zip(archs, triples))
+
+
+def load_config():
+    commit_hash = cmd_out(["git", "rev-parse", "--short=8", "HEAD"])
 
     # Default values
-    config['version'] = commit_hash
-    config['outdir'] = 'out'
+    config["version"] = commit_hash
+    config["versionCode"] = 1000000
+    config["outdir"] = "out"
+
+    args.config = Path(args.config)
 
     # Load prop files
-    if op.exists(args.config):
+    if args.config.exists():
         config.update(parse_props(args.config))
 
-    for key, value in parse_props('gradle.properties').items():
-        if key.startswith('magisk.'):
-            config[key[7:]] = value
+    gradle_props = Path("app", "gradle.properties")
+    if gradle_props.exists():
+        for key, value in parse_props(gradle_props).items():
+            if key.startswith("magisk."):
+                config[key[7:]] = value
 
     try:
-        config['versionCode'] = int(config['versionCode'])
+        config["versionCode"] = int(config["versionCode"])
     except ValueError:
         error('Config error: "versionCode" is required to be an integer')
 
-    mkdir_p(config['outdir'])
-    global STDOUT
-    STDOUT = None if args.verbose else subprocess.DEVNULL
+    config["outdir"] = Path(config["outdir"])
+    config["outdir"].mkdir(mode=0o755, parents=True, exist_ok=True)
 
-
-def collect_binary():
-    for arch in archs:
-        mkdir_p(op.join('native', 'out', arch))
-        for bin in support_targets:
-            source = op.join('native', 'libs', arch, bin)
-            target = op.join('native', 'out', arch, bin)
-            mv(source, target)
-
-
-def clean_elf():
-    if is_windows:
-        elf_cleaner = op.join('tools', 'elf-cleaner.exe')
+    if "abiList" in config:
+        abiList = re.split("\\s*,\\s*", config["abiList"])
+        archs = set(abiList) & support_abis.keys()
     else:
-        elf_cleaner = op.join('native', 'out', 'elf-cleaner')
-        if not op.exists(elf_cleaner):
-            execv(['g++', '-std=c++11', 'tools/termux-elf-cleaner/termux-elf-cleaner.cpp',
-                   '-o', elf_cleaner])
-    args = [elf_cleaner]
-    args.extend(op.join('native', 'out', arch, bin)
-                for arch in archs for bin in ['magisk', 'magiskpolicy'])
-    execv(args)
-
-
-def find_build_tools():
-    global build_tools
-    if build_tools:
-        return build_tools
-    build_tools_root = op.join(os.environ['ANDROID_SDK_ROOT'], 'build-tools')
-    ls = os.listdir(build_tools_root)
-    # Use the latest build tools available
-    ls.sort()
-    build_tools = op.join(build_tools_root, ls[-1])
-    return build_tools
-
-
-# Unused but keep this code
-def sign_zip(unsigned):
-    if 'keyStore' not in config:
-        return
-
-    msg = '* Signing APK'
-    apksigner = op.join(find_build_tools(), 'apksigner' + ('.bat' if is_windows else ''))
-
-    exec_args = [apksigner, 'sign',
-                 '--ks', config['keyStore'],
-                 '--ks-pass', f'pass:{config["keyStorePass"]}',
-                 '--ks-key-alias', config['keyAlias'],
-                 '--key-pass', f'pass:{config["keyPass"]}',
-                 '--v1-signer-name', 'CERT',
-                 '--v4-signing-enabled', 'false']
-
-    if unsigned.endswith('.zip'):
-        msg = '* Signing zip'
-        exec_args.extend(['--min-sdk-version', '17',
-                          '--v2-signing-enabled', 'false',
-                          '--v3-signing-enabled', 'false'])
-
-    exec_args.append(unsigned)
-
-    header(msg)
-    proc = execv(exec_args)
-    if proc.returncode != 0:
-        error('Signing failed!')
-
-
-def binary_dump(src, var_name):
-    out_str = f'constexpr unsigned char {var_name}[] = {{'
-    for i, c in enumerate(xz(src.read())):
-        if i % 16 == 0:
-            out_str += '\n'
-        out_str += f'0x{c:02X},'
-    out_str += '\n};\n'
-    return out_str
-
-
-def run_ndk_build(flags):
-    os.chdir('native')
-    proc = system(f'{ndk_build} {flags} -j{cpu_count}')
-    if proc.returncode != 0:
-        error('Build binary failed!')
-    os.chdir('..')
-    collect_binary()
-
-
-def write_if_diff(file_name, text):
-    do_write = True
-    if op.exists(file_name):
-        with open(file_name, 'r') as f:
-            orig = f.read()
-        do_write = orig != text
-    if do_write:
-        with open(file_name, 'w') as f:
-            f.write(text)
-
-
-def dump_bin_header():
-    stub = op.join(config['outdir'], 'stub-release.apk')
-    if not op.exists(stub):
-        error('Build stub APK before building "magiskinit"')
-    mkdir_p(native_gen_path)
-    with open(stub, 'rb') as src:
-        text = binary_dump(src, 'manager_xz')
-        write_if_diff(op.join(native_gen_path, 'binaries.h'), text)
+        archs = default_archs
+
+    set_archs(archs)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Magisk build script")
+    parser.set_defaults(func=lambda x: None)
+    parser.add_argument(
+        "-r", "--release", action="store_true", help="compile in release mode"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0, help="verbose output"
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default="config.prop",
+        help="custom config file (default: config.prop)",
+    )
+    subparsers = parser.add_subparsers(title="actions")
+
+    all_parser = subparsers.add_parser("all", help="build everything")
+
+    native_parser = subparsers.add_parser("native", help="build native binaries")
+    native_parser.add_argument(
+        "targets",
+        nargs="*",
+        help=f"{', '.join(support_targets)}, \
+        or empty for defaults ({', '.join(default_targets)})",
+    )
+
+    app_parser = subparsers.add_parser("app", help="build the Magisk app")
+
+    stub_parser = subparsers.add_parser("stub", help="build the stub app")
+
+    test_parser = subparsers.add_parser("test", help="build the test app")
+
+    clean_parser = subparsers.add_parser("clean", help="cleanup")
+    clean_parser.add_argument(
+        "targets", nargs="*", help="native, cpp, rust, java, or empty to clean all"
+    )
+
+    ndk_parser = subparsers.add_parser("ndk", help="setup Magisk NDK")
+
+    emu_parser = subparsers.add_parser("emulator", help="setup AVD for development")
+    emu_parser.add_argument("apk", help="a Magisk APK to use", nargs="?")
+    emu_parser.add_argument(
+        "-b", "--build", action="store_true", help="build before patching"
+    )
+
+    avd_patch_parser = subparsers.add_parser(
+        "avd_patch", help="patch AVD ramdisk.img or init_boot.img"
+    )
+    avd_patch_parser.add_argument("image", help="path to ramdisk.img or init_boot.img")
+    avd_patch_parser.add_argument("output", help="output file name")
+    avd_patch_parser.add_argument("--apk", help="a Magisk APK to use")
+    avd_patch_parser.add_argument(
+        "-b", "--build", action="store_true", help="build before patching"
+    )
+
+    cargo_parser = subparsers.add_parser(
+        "cargo", help="call 'cargo' commands against the project"
+    )
+    cargo_parser.add_argument("commands", nargs=argparse.REMAINDER)
+
+    clippy_parser = subparsers.add_parser("clippy", help="run clippy on Rust sources")
+
+    rustup_parser = subparsers.add_parser("rustup", help="setup rustup wrapper")
+    rustup_parser.add_argument(
+        "wrapper_dir", help="path to setup rustup wrapper binaries"
+    )
+
+    gen_parser = subparsers.add_parser("gen", help="generate files for IDE")
+    gen_parser.add_argument("--abi", default="arm64-v8a", help="target ABI to generate")
+
+    # Set callbacks
+    all_parser.set_defaults(func=build_all)
+    native_parser.set_defaults(func=build_native)
+    cargo_parser.set_defaults(func=cargo_cli)
+    clippy_parser.set_defaults(func=clippy_cli)
+    rustup_parser.set_defaults(func=setup_rustup)
+    gen_parser.set_defaults(func=gen_ide)
+    app_parser.set_defaults(func=build_app)
+    stub_parser.set_defaults(func=build_stub)
+    test_parser.set_defaults(func=build_test)
+    emu_parser.set_defaults(func=setup_avd)
+    avd_patch_parser.set_defaults(func=patch_avd_file)
+    clean_parser.set_defaults(func=cleanup)
+    ndk_parser.set_defaults(func=setup_ndk)
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+
+    return parser.parse_args()
+
+
+def main():
+    global args
+    args = parse_args()
+    load_config()
+    vars(args)["force_out"] = False
+    args.func()
 
 
-def dump_flag_header():
-    flag_txt = textwrap.dedent('''\
-        #pragma once
-        #define quote(s)            #s
-        #define str(s)              quote(s)
-        #define MAGISK_FULL_VER     MAGISK_VERSION "(" str(MAGISK_VER_CODE) ")"
-        #define NAME_WITH_VER(name) str(name) " " MAGISK_FULL_VER
-        ''')
-    flag_txt += f'#define MAGISK_VERSION      "{config["version"]}"\n'
-    flag_txt += f'#define MAGISK_VER_CODE     {config["versionCode"]}\n'
-    flag_txt += f'#define MAGISK_DEBUG        {0 if args.release else 1}\n'
-
-    mkdir_p(native_gen_path)
-    write_if_diff(op.join(native_gen_path, 'flags.h'), flag_txt)
-
-
-def build_binary(args):
-    # Verify NDK install
-    props = parse_props(op.join(ndk_path, 'source.properties'))
-    if props['Pkg.Revision'] != config['fullNdkVersion']:
-        error('Incorrect NDK. Please install/upgrade NDK with "build.py ndk"')
-
-    if 'target' not in vars(args):
-        vars(args)['target'] = []
-
-    if args.target:
-        args.target = set(args.target) & set(support_targets)
-        if not args.target:
-            return
-    else:
-        args.target = default_targets
-
-    header('* Building binaries: ' + ' '.join(args.target))
-
-    dump_flag_header()
-
-    flag = ''
-
-    if 'magisk' in args.target:
-        flag += ' B_MAGISK=1'
-
-    if 'magiskpolicy' in args.target:
-        flag += ' B_POLICY=1'
-
-    if 'test' in args.target:
-        flag += ' B_TEST=1'
-
-    if flag:
-        run_ndk_build(flag + ' B_SHARED=1')
-        clean_elf()
-
-    flag = ''
-
-    if 'magiskinit' in args.target:
-        dump_bin_header()
-        flag += ' B_INIT=1'
-
-    if 'resetprop' in args.target:
-        flag += ' B_PROP=1'
-
-    if 'magiskboot' in args.target:
-        flag += ' B_BOOT=1'
-
-    if flag:
-        run_ndk_build(flag)
-
-    if 'busybox' in args.target:
-        run_ndk_build('B_BB=1')
-
-
-def build_apk(args, module):
-    build_type = 'Release' if args.release or module == 'stub' else 'Debug'
-
-    proc = execv([gradlew, f'{module}:assemble{build_type}',
-                  '-PconfigPath=' + op.abspath(args.config)])
-    if proc.returncode != 0:
-        error(f'Build {module} failed!')
-
-    build_type = build_type.lower()
-
-    apk = f'{module}-{build_type}.apk'
-    source = op.join(module, 'build', 'outputs', 'apk', build_type, apk)
-    target = op.join(config['outdir'], apk)
-    mv(source, target)
-    header('Output: ' + target)
-
-
-def build_app(args):
-    header('* Building the Magisk app')
-    build_apk(args, 'app')
-
-
-def build_stub(args):
-    header('* Building the stub app')
-    build_apk(args, 'stub')
-
-
-def cleanup(args):
-    support_targets = {'native', 'java'}
-    if args.target:
-        args.target = set(args.target) & support_targets
-    else:
-        # If nothing specified, clean everything
-        args.target = support_targets
-
-    if 'native' in args.target:
-        header('* Cleaning native')
-        rm_rf(op.join('native', 'out'))
-        rm_rf(op.join('native', 'libs'))
-        rm_rf(op.join('native', 'obj'))
-
-    if 'java' in args.target:
-        header('* Cleaning java')
-        execv([gradlew, 'clean'])
-
-
-def setup_ndk(args):
-    os_name = platform.system().lower()
-    ndk_ver = config['ndkVersion']
-    url = f'https://dl.google.com/android/repository/android-ndk-r{ndk_ver}-{os_name}.zip'
-    ndk_zip = url.split('/')[-1]
-
-    header(f'* Downloading {ndk_zip}')
-    with urllib.request.urlopen(url) as response, open(ndk_zip, 'wb') as out_file:
-        shutil.copyfileobj(response, out_file)
-
-    header('* Extracting NDK zip')
-    rm_rf(ndk_path)
-    with zipfile.ZipFile(ndk_zip, 'r') as zf:
-        for info in zf.infolist():
-            vprint(f'Extracting {info.filename}')
-            if info.external_attr >> 28 == 0xA:  # symlink
-                src = zf.read(info).decode("utf-8")
-                dest = op.join(ndk_root, info.filename)
-                os.symlink(src, dest)
-                continue
-            extracted_path = zf.extract(info, ndk_root)
-            if info.create_system == 3:  # ZIP_UNIX_SYSTEM = 3
-                unix_attributes = info.external_attr >> 16
-            if unix_attributes:
-                os.chmod(extracted_path, unix_attributes)
-    mv(op.join(ndk_root, f'android-ndk-r{ndk_ver}'), ndk_path)
-
-    header('* Patching static libs')
-    for target in ['aarch64-linux-android', 'arm-linux-androideabi',
-                   'i686-linux-android', 'x86_64-linux-android']:
-        arch = target.split('-')[0]
-        lib_dir = op.join(
-            ndk_path, 'toolchains', 'llvm', 'prebuilt', f'{os_name}-x86_64',
-            'sysroot', 'usr', 'lib', f'{target}', '21')
-        if not op.exists(lib_dir):
-            continue
-        src_dir = op.join('tools', 'ndk-bins', '21', arch)
-        rm(op.join(src_dir, '.DS_Store'))
-        for path in copy_tree(src_dir, lib_dir):
-            vprint(f'Replaced {path}')
-
-
-def setup_avd(args):
-    if not args.skip:
-        build_binary(args)
-        build_app(args)
-
-    header('* Setting up emulator')
-
-    abi = cmd_out([adb_path, 'shell', 'getprop', 'ro.product.cpu.abi'])
-    proc = execv([adb_path, 'push', f'native/out/{abi}/busybox', 'out/app-debug.apk',
-           'scripts/avd_magisk.sh', '/data/local/tmp'])
-    if proc.returncode != 0:
-        error('adb push failed!')
-
-    proc = execv([adb_path, 'shell', 'sh', '/data/local/tmp/avd_magisk.sh'])
-    if proc.returncode != 0:
-        error('avd_magisk.sh failed!')
-
-
-def patch_avd_ramdisk(args):
-    if not args.skip:
-        build_binary(args)
-        build_app(args)
-
-    header('* Patching emulator ramdisk.img')
-
-    # Create a backup to prevent accidental overwrites
-    backup = args.ramdisk + '.bak'
-    if not op.exists(backup):
-        cp(args.ramdisk, backup)
-
-    ini = op.join(op.dirname(args.ramdisk), 'advancedFeatures.ini')
-    with open(ini, 'r') as f:
-        adv_ft = f.read()
-
-    # Need to turn off system as root
-    if 'SystemAsRoot = on' in adv_ft:
-        # Create a backup
-        cp(ini, ini + '.bak')
-        adv_ft = adv_ft.replace('SystemAsRoot = on', 'SystemAsRoot = off')
-        with open(ini, 'w') as f:
-            f.write(adv_ft)
-
-    abi = cmd_out([adb_path, 'shell', 'getprop', 'ro.product.cpu.abi'])
-    proc = execv([adb_path, 'push', f'native/out/{abi}/busybox', 'out/app-debug.apk',
-           'scripts/avd_patch.sh', '/data/local/tmp'])
-    if proc.returncode != 0:
-        error('adb push failed!')
-    proc = execv([adb_path, 'push', backup, '/data/local/tmp/ramdisk.cpio.tmp'])
-    if proc.returncode != 0:
-        error('adb push failed!')
-
-    proc = execv([adb_path, 'shell', 'sh', '/data/local/tmp/avd_patch.sh'])
-    if proc.returncode != 0:
-        error('avd_patch.sh failed!')
-
-    proc = execv([adb_path, 'pull', '/data/local/tmp/ramdisk.cpio.gz', args.ramdisk])
-    if proc.returncode != 0:
-        error('adb pull failed!')
-
-
-def build_all(args):
-    build_stub(args)
-    build_binary(args)
-    build_app(args)
-
-
-parser = argparse.ArgumentParser(description='Magisk build script')
-parser.set_defaults(func=lambda x: None)
-parser.add_argument('-r', '--release', action='store_true',
-                    help='compile in release mode')
-parser.add_argument('-v', '--verbose', action='store_true',
-                    help='verbose output')
-parser.add_argument('-c', '--config', default='config.prop',
-                    help='custom config file (default: config.prop)')
-subparsers = parser.add_subparsers(title='actions')
-
-all_parser = subparsers.add_parser(
-    'all', help='build everything')
-all_parser.set_defaults(func=build_all)
-
-binary_parser = subparsers.add_parser('binary', help='build binaries')
-binary_parser.add_argument(
-    'target', nargs='*', help=f"{', '.join(support_targets)}, \
-    or empty for defaults ({', '.join(default_targets)})")
-binary_parser.set_defaults(func=build_binary)
-
-app_parser = subparsers.add_parser('app', help='build the Magisk app')
-app_parser.set_defaults(func=build_app)
-
-stub_parser = subparsers.add_parser('stub', help='build the stub app')
-stub_parser.set_defaults(func=build_stub)
-
-avd_parser = subparsers.add_parser(
-    'emulator', help='setup AVD for development')
-avd_parser.add_argument('-s', '--skip', action='store_true',
-    help='skip building binaries and the app')
-avd_parser.set_defaults(func=setup_avd)
-
-avd_patch_parser = subparsers.add_parser(
-    'avd_patch', help='patch AVD ramdisk.img')
-avd_patch_parser.add_argument('ramdisk', help='path to ramdisk.img')
-avd_patch_parser.add_argument('-s', '--skip', action='store_true',
-    help='skip building binaries and the app')
-avd_patch_parser.set_defaults(func=patch_avd_ramdisk)
-
-clean_parser = subparsers.add_parser('clean', help='cleanup')
-clean_parser.add_argument(
-    'target', nargs='*', help='native, java, or empty to clean both')
-clean_parser.set_defaults(func=cleanup)
-
-ndk_parser = subparsers.add_parser('ndk', help='setup Magisk NDK')
-ndk_parser.set_defaults(func=setup_ndk)
-
-if len(sys.argv) == 1:
-    parser.print_help()
-    sys.exit(1)
-
-args = parser.parse_args()
-load_config(args)
-
-# Call corresponding functions
-args.func(args)
+if __name__ == "__main__":
+    main()

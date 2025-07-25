@@ -1,10 +1,8 @@
-out
-*.zip
-*.jks
-*.apk
-/config.prop
-/update.sh
-/dict.txt
+# Java
+*.class
+
+# Mobile Tools for Java
+.mtj.tmp/
 
 # Built binaries
 native/out
@@ -14,9 +12,23 @@ native/out
 .gradle
 /local.properties
 /.idea
+.idea
 /build
 /captures
 .ccache
 ccache
 .history
 .vscode
+
+# Rust
+target/
+Cargo.lock
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
