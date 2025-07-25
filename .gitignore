@@ -23,3 +23,12 @@ ccache
 # Rust
 target/
 Cargo.lock
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
